@@ -12,11 +12,14 @@ import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.kafka.common.errors.ApiException;
 import org.apache.kafka.common.message.ApiVersionsRequestData;
 import org.apache.kafka.common.message.ApiVersionsResponseData;
 import org.apache.kafka.common.message.ApiVersionsResponseDataJsonConverter;
 import org.apache.kafka.common.message.ResponseHeaderData;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.common.requests.ApiVersionsRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +52,8 @@ import io.kroxylicious.proxy.internal.codec.KafkaResponseDecoder;
 import io.kroxylicious.proxy.model.VirtualCluster;
 import io.kroxylicious.proxy.service.HostPort;
 import io.kroxylicious.proxy.tag.VisibleForTesting;
+
+import static org.apache.kafka.common.protocol.ApiKeys.API_VERSIONS;
 
 public class KafkaProxyFrontendHandler
         extends ChannelInboundHandlerAdapter
@@ -220,10 +225,23 @@ public class KafkaProxyFrontendHandler
     private void handleApiVersionsFrame(ChannelHandlerContext ctx, Object msg) {
         state = State.API_VERSIONS;
         DecodedRequestFrame<ApiVersionsRequestData> apiVersionsFrame = (DecodedRequestFrame<ApiVersionsRequestData>) msg;
-        storeApiVersionsFeatures(apiVersionsFrame);
+        var apiVersionsRequest = API_VERSIONS.isVersionSupported(apiVersionsFrame.apiVersion())
+                ? new ApiVersionsRequest(apiVersionsFrame.body(), apiVersionsFrame.apiVersion())
+                : new ApiVersionsRequest(apiVersionsFrame.body(), (short) 0, apiVersionsFrame.apiVersion());
+        try {
+            apiVersionService.setApiVersionsRequest(apiVersionsRequest);
+        }
+        catch (ApiException e) {
+            writeApiVersionsResponse(ctx, apiVersionsFrame, apiVersionsRequest.getErrorResponse(e).data());
+            // Request to read the following request
+            ctx.channel().read();
+            return;
+        }
+
+        storeApiVersionsFeatures(apiVersionsRequest.data());
         if (dp.isAuthenticationOffloadEnabled()) {
             // This handler can respond to ApiVersions itself
-            writeApiVersionsResponse(ctx, apiVersionsFrame);
+            writeApiVersionsResponse(ctx, apiVersionsFrame, API_VERSIONS_RESPONSE);
             // Request to read the following request
             ctx.channel().read();
         }
@@ -378,23 +396,20 @@ public class KafkaProxyFrontendHandler
      * Sends an ApiVersions response from this handler to the client
      * (i.e. prior to having backend connection)
      */
-    private void writeApiVersionsResponse(ChannelHandlerContext ctx, DecodedRequestFrame<ApiVersionsRequestData> frame) {
+    private void writeApiVersionsResponse(ChannelHandlerContext ctx, DecodedRequestFrame<ApiVersionsRequestData> frame,
+                                          ApiMessage response) {
 
         short apiVersion = frame.apiVersion();
         int correlationId = frame.correlationId();
         ResponseHeaderData header = new ResponseHeaderData()
                 .setCorrelationId(correlationId);
         LOGGER.debug("{}: Writing ApiVersions response", ctx.channel());
-        ctx.writeAndFlush(new DecodedResponseFrame<>(
-                apiVersion, correlationId, header, API_VERSIONS_RESPONSE));
+        ctx.writeAndFlush(new DecodedResponseFrame<>(apiVersion, correlationId, header, response));
     }
 
-    private void storeApiVersionsFeatures(DecodedRequestFrame<ApiVersionsRequestData> frame) {
-        // TODO check the format of the strings using a regex
-        // Needed to reproduce the exact behaviour for how a broker handles this
-        // see org.apache.kafka.common.requests.ApiVersionsRequest#isValid()
-        this.clientSoftwareName = frame.body().clientSoftwareName();
-        this.clientSoftwareVersion = frame.body().clientSoftwareVersion();
+    private void storeApiVersionsFeatures(ApiVersionsRequestData requestData) {
+        this.clientSoftwareName = requestData.clientSoftwareName();
+        this.clientSoftwareVersion = requestData.clientSoftwareVersion();
     }
 
     public void outboundWritabilityChanged(ChannelHandlerContext outboundCtx) {
